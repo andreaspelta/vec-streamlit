@@ -13,7 +13,6 @@ TZ = "Europe/Rome"
 # Demo data (small, in-memory)
 # -------------------------
 def make_demo_loads():
-    """Return tiny HH and SHOP dataframes with the required columns."""
     t = pd.date_range("2024-01-01 00:00", periods=8, freq="15min", tz=TZ)
     hh = pd.DataFrame({
         "timestamp (Europe/Rome, ISO8601)": t.strftime("%Y-%m-%d %H:%M:%S%z"),
@@ -28,19 +27,11 @@ def make_demo_loads():
     })
     return hh, shop
 
-
 def make_demo_pv_json():
     t = pd.date_range("2024-06-21 05:00", periods=6, freq="h", tz=TZ)  # 'h' not 'H'
-
-    recs = []
     vals = [0.0, 0.12, 0.35, 0.48, 0.42, 0.20]
-    for ts, v in zip(t, vals):
-        recs.append({
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S%z"),
-            "energy_kWh_per_kWp": v
-        })
+    recs = [{"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S%z"), "energy_kWh_per_kWp": v} for ts, v in zip(t, vals)]
     return {"timezone": TZ, "unit": "kWh per kWp per hour", "records": recs}
-
 
 def make_demo_prices():
     hours = pd.date_range("2024-01-01", periods=24, freq="H", tz=TZ)
