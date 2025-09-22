@@ -1,0 +1,13 @@
+streamlit
+numpy
+pandas
+scipy
+matplotlib
+plotly
+pyarrow
+openpyxl
+xlsxwriter
+pytz
+python-dateutil
+statsmodels
+scikit-learn
