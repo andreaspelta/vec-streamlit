@@ -27,7 +27,7 @@ def make_demo_loads():
     return hh, shop
 
 def make_demo_pv_json():
-    t = pd.date_range("2024-06-21 05:00", periods=6, freq="H", tz=TZ)
+    t = pd.date_range("2024-06-21 05:00", periods=6, freq="h", tz=TZ)  # 'h' instead of 'H'
     recs = []
     vals = [0.0, 0.12, 0.35, 0.48, 0.42, 0.20]
     for ts, v in zip(t, vals):
@@ -36,6 +36,7 @@ def make_demo_pv_json():
             "energy_kWh_per_kWp": v
         })
     return {"timezone": TZ, "unit": "kWh per kWp per hour", "records": recs}
+
 
 def make_demo_prices():
     hours = pd.date_range("2024-01-01", periods=24, freq="H", tz=TZ)
