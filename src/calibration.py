@@ -18,12 +18,15 @@ def load_households_excel(file) -> pd.DataFrame:
         df = xl.parse(sheet)
         # Normalize columns
         tcol = [c for c in df.columns if "timestamp" in c.lower()][0]
-        pcol = [c for c in df.columns if "power" in c.lower()][0]
+        p_candidates = [c for c in df.columns if ("power" in c.lower()) and ("kw" in c.lower())]
+        if not p_candidates:
+            raise ValueError("Household sheet is missing a power column in kW.")
+        pcol = p_candidates[0]
         df = df.rename(columns={tcol: "timestamp", pcol: "power_kW"})
         df["meter"] = sheet
         frames.append(df[["timestamp","power_kW","meter"]])
     out = pd.concat(frames, ignore_index=True)
-    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
     return out
 
 def load_shops_excel(file) -> pd.DataFrame:
@@ -32,12 +35,19 @@ def load_shops_excel(file) -> pd.DataFrame:
     for sheet in xl.sheet_names:
         df = xl.parse(sheet)
         tcol = [c for c in df.columns if "timestamp" in c.lower()][0]
-        ecol = [c for c in df.columns if "activeenergy_generale" in c.lower()][0]
+        # Accept either the canonical "ActiveEnergy_Generale" or any kWh column
+        if any("activeenergy_generale" in c.lower() for c in df.columns):
+            ecol = [c for c in df.columns if "activeenergy_generale" in c.lower()][0]
+        else:
+            kwh_cols = [c for c in df.columns if ("kwh" in c.lower())]
+            if not kwh_cols:
+                raise ValueError("Shop sheet is missing an energy column in kWh.")
+            ecol = kwh_cols[0]
         df = df.rename(columns={tcol: "timestamp", ecol: "energy_kWh"})
         df["meter"] = sheet
         frames.append(df[["timestamp","energy_kWh","meter"]])
     out = pd.concat(frames, ignore_index=True)
-    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
     return out
 
 # ---------------------------
@@ -65,6 +75,23 @@ def cluster_label(dt):
 def calibrate_households(raw: pd.DataFrame) -> Dict[str,Any]:
     assert raw is not None and len(raw)>0, "No HH data"
     df = raw.copy()
+
+    # --- NEW: tolerate user/demo headers and normalize ---
+    # timestamp
+    if "timestamp" not in df.columns:
+        tcols = [c for c in df.columns if "timestamp" in c.lower()]
+        if not tcols:
+            raise ValueError("Household data has no timestamp column.")
+        df = df.rename(columns={tcols[0]: "timestamp"})
+    # power_kW
+    if "power_kW" not in df.columns:
+        pcols = [c for c in df.columns if ("power" in c.lower()) and ("kw" in c.lower())]
+        if not pcols:
+            raise ValueError("Household data has no power_kW column (kW).")
+        df = df.rename(columns={pcols[0]: "power_kW"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    # -----------------------------------------------------
+
     # 15-min kW -> hourly kWh
     df["kWh_15"] = df["power_kW"] * 0.25
     df["date"] = df["timestamp"].dt.date
@@ -75,27 +102,22 @@ def calibrate_households(raw: pd.DataFrame) -> Dict[str,Any]:
     day = agg.groupby(["meter","date","cluster"], as_index=False)["kWh_15"].sum().rename(columns={"kWh_15":"E_day"})
     merged = agg.merge(day, on=["meter","date","cluster"], how="left")
 
-    # Hourly shares per day (exclude zero-day totals)
     pos = merged[merged["E_day"]>0].copy()
     pos["share"] = pos["kWh_15"] / pos["E_day"]
 
     mu = pos.groupby(["cluster","hour"])["share"].median().reset_index()
-    # Normalize mu within each cluster to sum to 1
     mu["sum_c"] = mu.groupby("cluster")["share"].transform("sum")
     mu["mu"] = mu["share"] / mu["sum_c"]
     mu = mu.pivot(index="cluster", columns="hour", values="mu").reindex(sorted(pos["cluster"].unique()))
     mu = mu.fillna(0.0)
 
-    # Day scaler D: ln(D) ~ Normal(0, sigma^2), enforce median 1 => mean=0
-    # Estimate sigma from ln(E_day / median(E_day by cluster))
     day_m = day.copy()
     med = day_m.groupby("cluster")["E_day"].transform("median")
     eps = np.log(np.where(day_m["E_day"]>0, day_m["E_day"], np.nan) / med)
     sigma_lnD = pd.Series(eps).groupby(day_m["cluster"]).std(ddof=1)
-    sigma_lnD = sigma_lnD.replace([np.inf, -np.inf], np.nan).fillna(0.25)  # fallback
+    sigma_lnD = sigma_lnD.replace([np.inf, -np.inf], np.nan).fillna(0.25)
 
-    # Hourly log-residuals sigma per cluster & hour
-    # residual = ln(kWh_hour / (D * mu_hour)) with D = E_day / median(E_day)
+    merged = merged.merge(day_m[["meter","date","cluster","E_day"]], on=["meter","date","cluster"])
     day_m["D"] = np.where(day_m["E_day"]>0, day_m["E_day"]/med, 1.0)
     merged = merged.merge(day_m[["meter","date","cluster","D"]], on=["meter","date","cluster"])
     merged = merged.merge(mu.reset_index().melt(id_vars="cluster", var_name="hour", value_name="mu").rename(columns={"mu":"mu_h"}), on=["cluster","hour"])
@@ -132,6 +154,26 @@ def render_household_diagnostics(params: Dict[str,Any]):
 def calibrate_shops(raw: pd.DataFrame) -> Dict[str,Any]:
     assert raw is not None and len(raw)>0, "No SHOP data"
     df = raw.copy()
+
+    # --- NEW: tolerate user/demo headers and normalize ---
+    if "timestamp" not in df.columns:
+        tcols = [c for c in df.columns if "timestamp" in c.lower()]
+        if not tcols:
+            raise ValueError("Shop data has no timestamp column.")
+        df = df.rename(columns={tcols[0]: "timestamp"})
+    if "energy_kWh" not in df.columns:
+        # accept ActiveEnergy_Generale or any *kWh* column
+        if any("activeenergy_generale" in c.lower() for c in df.columns):
+            ecol = [c for c in df.columns if "activeenergy_generale" in c.lower()][0]
+        else:
+            kwh_cols = [c for c in df.columns if "kwh" in c.lower()]
+            if not kwh_cols:
+                raise ValueError("Shop data has no kWh energy column.")
+            ecol = kwh_cols[0]
+        df = df.rename(columns={ecol: "energy_kWh"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    # -----------------------------------------------------
+
     df["date"] = df["timestamp"].dt.date
     df["hour"] = df["timestamp"].dt.hour
     df["cluster"] = pd.to_datetime(df["timestamp"]).apply(cluster_label)
@@ -140,24 +182,20 @@ def calibrate_shops(raw: pd.DataFrame) -> Dict[str,Any]:
     day = agg.groupby(["meter","date","cluster"], as_index=False)["energy_kWh"].sum().rename(columns={"energy_kWh":"E_day"})
     merged = agg.merge(day, on=["meter","date","cluster"], how="left")
 
-    # Zero mass per hour in each cluster
     p_zero = (merged["energy_kWh"]==0).groupby([merged["cluster"], merged["hour"]]).mean().unstack("hour").fillna(0.0)
 
     pos = merged[(merged["E_day"]>0) & (merged["energy_kWh"]>0)].copy()
     pos["share"] = pos["energy_kWh"] / pos["E_day"]
     mu_tilde = pos.groupby(["cluster","hour"])["share"].median().unstack("hour").fillna(0.0)
 
-    # Zero-aware normalization:
     denom = (mu_tilde * (1 - p_zero)).sum(axis=1).replace(0, np.nan)
     mu = mu_tilde.div(denom, axis=0).fillna(0.0)
 
-    # Day scaler ln(D) ~ Normal(0, sigma^2)
     day_m = day.copy()
     med = day_m.groupby("cluster")["E_day"].transform("median")
     eps = np.log(np.where(day_m["E_day"]>0, day_m["E_day"], np.nan) / med)
     sigma_lnD = pd.Series(eps).groupby(day_m["cluster"]).std(ddof=1).replace([np.inf, -np.inf], np.nan).fillna(0.30)
 
-    # Residual σ per cluster/hour for positives
     merged = merged.merge(mu.reset_index().melt(id_vars="cluster", var_name="hour", value_name="mu").rename(columns={"mu":"mu_h"}), on=["cluster","hour"])
     day_m["D"] = np.where(day_m["E_day"]>0, day_m["E_day"]/med, 1.0)
     merged = merged.merge(day_m[["meter","date","cluster","D"]], on=["meter","date","cluster"])
@@ -194,3 +232,4 @@ def render_shop_diagnostics(params: Dict[str,Any]):
     sig = params["sigma_resid"]
     fig3 = px.imshow(sig, aspect="auto", labels=dict(color="σ"), title="Hourly log-residual σ (clusters × hours)")
     st.plotly_chart(fig3, use_container_width=True)
+
