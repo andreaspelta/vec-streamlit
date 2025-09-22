@@ -1,5 +1,4 @@
 from typing import Dict, Any
-import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -7,12 +6,17 @@ import plotly.express as px
 from scipy import stats
 
 TZ = "Europe/Rome"
+SEASONS = ["Winter", "Spring", "Summer", "Autumn"]
 
 def load_pv_json(pv_json: Dict[str,Any]) -> pd.DataFrame:
+    """Load per-kWp hourly PV JSON -> DataFrame with tz-aware timestamps."""
     recs = pv_json.get("records", [])
     df = pd.DataFrame(recs)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.rename(columns={"energy_kWh_per_kWp":"kWh_per_kWp"})
+    if "timestamp" not in df.columns or "energy_kWh_per_kWp" not in df.columns:
+        raise ValueError("PV JSON must contain records with 'timestamp' and 'energy_kWh_per_kWp'.")
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.rename(columns={"energy_kWh_per_kWp": "kWh_per_kWp"})
+    df = df.dropna(subset=["timestamp"])
     return df
 
 def season_of(dt):
@@ -22,84 +26,135 @@ def season_of(dt):
     if m in (6,7,8): return "Summer"
     return "Autumn"
 
+def _default_envelope() -> pd.Series:
+    """Return a simple bell-shaped daylight envelope over 24h normalized to sum=1."""
+    h = np.arange(24)
+    # Midday-centered smooth bump; clip nights to 0, normalize to sum=1
+    bump = np.exp(-0.5*((h-13)/3.5)**2)
+    bump[h < 6] = 0.0
+    bump[h > 20] = 0.0
+    s = bump / max(bump.sum(), 1e-9)
+    return pd.Series(s, index=range(24))
+
+def _fit_loglogistic_to_unit_median(x: np.ndarray) -> Dict[str,float]:
+    """Fit Fisk (log-logistic) to positive x and renormalize scale to median≈1; provide defaults if scarce."""
+    v = np.asarray(x, dtype=float)
+    v = v[(v>0) & np.isfinite(v)]
+    if v.size < 6:
+        return {"c": 2.0, "scale": 1.0}
+    c, loc, scale = stats.fisk.fit(v, floc=0)  # loc=0
+    # median(Fisk) = scale, so normalize to 1
+    med = np.median(v)
+    scale_adj = scale / max(med, 1e-12)
+    return {"c": float(c), "scale": float(scale_adj)}
+
+def _markov_from_daily(daily_vals: np.ndarray) -> np.ndarray:
+    """Two-state (Cloud/Clear) Markov transition from daily totals via median threshold; robust fallback."""
+    vals = np.asarray(daily_vals, dtype=float)
+    if vals.size < 3:
+        return np.array([[0.7, 0.3],[0.3, 0.7]])
+    thr = np.median(vals)
+    states = (vals >= thr).astype(int)  # 1=Clear, 0=Cloud
+    n00 = np.sum((states[:-1]==0)&(states[1:]==0))
+    n01 = np.sum((states[:-1]==0)&(states[1:]==1))
+    n10 = np.sum((states[:-1]==1)&(states[1:]==0))
+    n11 = np.sum((states[:-1]==1)&(states[1:]==1))
+    P = np.array([
+        [n00/(n00+n01+1e-9), n01/(n00+n01+1e-9)],
+        [n10/(n10+n11+1e-9), n11/(n10+n11+1e-9)]
+    ])
+    # Ensure entries are finite and rows sum to ~1
+    if not np.all(np.isfinite(P)) or np.any(P<0):
+        P = np.array([[0.7, 0.3],[0.3, 0.7]])
+    return P
+
+def _beta_from_ratios(ratios: np.ndarray) -> Dict[str,float]:
+    """Crude MOM Beta fit on (0,1) using rescaled ratios; fallback to alpha=beta=5."""
+    x = np.asarray(ratios, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 8:
+        return {"alpha": 5.0, "beta": 5.0}
+    # Rescale to (0,1): heuristic y = x/(1+m)
+    m = x.mean()
+    y = (x / (1.0 + max(m, 1e-9))).clip(1e-3, 1-1e-3)
+    my = y.mean()
+    vy = y.var()
+    if vy <= 0 or my <= 0 or my >= 1:
+        return {"alpha": 5.0, "beta": 5.0}
+    a = my*(my*(1-my)/vy - 1)
+    b = (1-my)*(my*(1-my)/vy - 1)
+    if not np.isfinite(a) or not np.isfinite(b) or a<=0 or b<=0:
+        return {"alpha": 5.0, "beta": 5.0}
+    return {"alpha": float(a), "beta": float(b)}
+
 def calibrate_pv(pv_json: Dict[str,Any]) -> Dict[str,Any]:
+    """
+    Build PV parameters for ALL seasons. For missing seasons we provide safe defaults:
+    - Envelope S_s,h: default bell daylight profile (sum=1)
+    - Log-logistic daily multiplier: c=2, scale=1 (median≈1)
+    - 2-state Markov P: [[0.7,0.3],[0.3,0.7]]
+    - Beta(alpha=5, beta=5) for clearness
+    """
     df = load_pv_json(pv_json)
     df["season"] = df["timestamp"].apply(season_of)
     df["date"] = df["timestamp"].dt.date
     df["hour"] = df["timestamp"].dt.hour
 
-    # Seasonal envelope S_s,h: average profile per season normalized to sum to 1 on daylight hours
-    prof = df.groupby(["season","hour"])["kWh_per_kWp"].mean().unstack("hour").fillna(0.0)
-    # Zero out nighttime (values very small)
-    prof = prof.mask(prof < prof.max().quantile(0.1), 0.0)
-    S = prof.div(prof.sum(axis=1).replace(0, np.nan), axis=0).fillna(0.0)
+    # Envelope by season: average hourly per season, daylight normalized
+    S_rows = {}
+    for s in SEASONS:
+        if s in df["season"].unique():
+            prof = df[df["season"]==s].groupby("hour")["kWh_per_kWp"].mean().reindex(range(24), fill_value=0.0)
+            # Zero-out nights (heuristic) and normalize
+            daylight = prof.copy()
+            daylight[daylight < daylight.max()*0.1] = 0.0
+            total = daylight.sum()
+            if total <= 0:
+                S_rows[s] = _default_envelope().values
+            else:
+                S_rows[s] = (daylight / total).values
+        else:
+            S_rows[s] = _default_envelope().values
+    S = pd.DataFrame(S_rows, index=range(24)).T  # seasons x 24
+    S.index.name = "season"
 
-    # Daily totals and M_t (log-logistic with median ~1)
-    day = df.groupby(["season","date"])["kWh_per_kWp"].sum().reset_index()
-    M_raw = day.groupby("season")["kWh_per_kWp"].apply(lambda x: x / x.median())
-    # Fit log-logistic via scipy.fisk (shape c, scale) per season
+    # Daily totals and multipliers per season (M / median)
     ll_params = {}
-    for s, x in M_raw.groupby(level=0):
-        v = x.values
-        v = v[(v>0) & np.isfinite(v)]
-        if len(v) < 5:
-            ll_params[s] = {"c": 2.0, "scale": 1.0}
-        else:
-            # Fix location=0; estimate c, loc, scale; force loc=0
-            c, loc, scale = stats.fisk.fit(v, floc=0)
-            # normalize scale so that median ≈ 1 (median of Fisk = scale * (1)^(1/c) = scale)
-            ll_params[s] = {"c": float(c), "scale": float(scale / np.median(v))}
-    # Markov day-state (two-state Clear/Cloud) by threshold on daily total
     markov = {}
-    for s, grp in day.groupby("season"):
-        vals = grp["kWh_per_kWp"].values
-        thr = np.median(vals)
-        states = (vals >= thr).astype(int)  # 1=Clear, 0=Cloud
-        if len(states) < 3:
-            P = np.array([[0.7,0.3],[0.3,0.7]])
+    for s in SEASONS:
+        if s in df["season"].unique():
+            day = df[df["season"]==s].groupby("date")["kWh_per_kWp"].sum().sort_index()
+            # Log-logistic
+            ll_params[s] = _fit_loglogistic_to_unit_median(day.values)
+            # Markov P
+            P = _markov_from_daily(day.values)
+            # Beta from (hour / envelope share) ratios
+            part = df[df["season"]==s].copy()
+            env = pd.Series(S.loc[s].values, index=range(24)).replace(0, np.nan)
+            part["ratio"] = part.apply(lambda r: r["kWh_per_kWp"] / env.get(r["hour"], np.nan), axis=1)
+            ratios = part["ratio"].replace([np.inf, -np.inf], np.nan).dropna().values
+            beta_ab = _beta_from_ratios(ratios)
+            markov[s] = {"P": P.tolist(), "beta": beta_ab}
         else:
-            n00 = np.sum((states[:-1]==0)&(states[1:]==0))
-            n01 = np.sum((states[:-1]==0)&(states[1:]==1))
-            n10 = np.sum((states[:-1]==1)&(states[1:]==0))
-            n11 = np.sum((states[:-1]==1)&(states[1:]==1))
-            P = np.array([
-                [n00/(n00+n01+1e-9), n01/(n00+n01+1e-9)],
-                [n10/(n10+n11+1e-9), n11/(n10+n11+1e-9)]
-            ])
-        # Beta clearness per hour/state: derive alpha,beta from moments on (hourly / envelope share)
-        # Approximation: use same beta params for both states per season
-        cl = df[df["season"]==s].copy()
-        env = S.loc[s].replace(0, np.nan)
-        cl["ratio"] = cl.apply(lambda r: r["kWh_per_kWp"] / (env.get(r["hour"], np.nan)), axis=1)
-        x = cl["ratio"].replace([np.inf, -np.inf], np.nan).dropna()
-        x = x[(x>0) & (x<5)]  # crude trimming
-        m = x.mean() if len(x)>0 else 1.0
-        v = x.var() if len(x)>1 else 0.1
-        # MOM for Beta on (0,1) -> rescale ratio to (0,1) by / (1+m)
-        y = (x / (1+m)).clip(1e-3, 1-1e-3)
-        my = y.mean() if len(y)>0 else 0.5
-        vy = y.var() if len(y)>1 else 0.05
-        # alpha,beta from mean/var
-        if vy<=0 or my<=0 or my>=1:
-            a,b = 5.0,5.0
-        else:
-            a = my*(my*(1-my)/vy - 1)
-            b = (1-my)*(my*(1-my)/vy - 1)
-            if not np.isfinite(a) or not np.isfinite(b) or a<=0 or b<=0:
-                a,b = 5.0,5.0
-        markov[s] = {"P": P.tolist(), "beta": {"alpha": float(a), "beta": float(b)}}
+            ll_params[s] = {"c": 2.0, "scale": 1.0}
+            markov[s] = {"P": [[0.7,0.3],[0.3,0.7]], "beta": {"alpha": 5.0, "beta": 5.0}}
 
-    params = {"S": S, "loglogistic": ll_params, "markov": markov,
-              "hash_base": {"S_head": S.iloc[:,:6].to_dict(), "ll": ll_params, "markov": markov}}
+    params = {
+        "S": S,                  # DataFrame (seasons x 24)
+        "loglogistic": ll_params,
+        "markov": markov,
+        "hash_base": {
+            "S_head": S.iloc[:, :6].to_dict(),
+            "ll": ll_params,
+            "markov": markov
+        }
+    }
     return params
 
 def render_pv_diagnostics(params):
-    st.markdown("**Seasonal envelopes S_s,h**")
+    st.markdown("**Seasonal envelopes S_s,h (per kWp)**")
     S = params["S"]
-    fig = px.line(S.T, x=S.T.index, y=S.T.columns, labels={"x":"hour","value":"share"}, title="PV seasonal envelopes (per kWp)")
-    st.plotly_chart(fig, use_container_width=True)
-
-def make_demo_pv_json():
-    # Reuse in utils; keeping alias for clarity
-    from src.utils import make_demo_pv_json as demo
-    return demo()
+    fig = px.line(S.T, x=S.T.index, y=S.T.columns,
+                  labels={"x":"hour","value":"share"},
+                  title="PV seasonal envelopes")
+    st.plotly_chart(fig, width="stretch")
