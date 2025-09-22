@@ -111,7 +111,6 @@ def sample_pv(pv_params, kWp_map, hours_idx, S, rng):
         if P.shape != (2,2) or not np.all(np.isfinite(P)):
             P = DEF_P
         if s not in prev:
-            # stationary approx for 2-state chain
             pi1 = P[0,1]/(P[0,1]+P[1,0]+1e-9)
             state = int(rng.uniform() < pi1)
         else:
@@ -126,7 +125,6 @@ def sample_pv(pv_params, kWp_map, hours_idx, S, rng):
     for d, s, _ in states:
         pars = ll.get(s, DEF_LL)
         c = float(pars.get("c", 2.0)); sc = float(pars.get("scale", 1.0))
-        # rvs handles Generator via random_state=
         M = stats.fisk.rvs(c, loc=0, scale=sc, random_state=rng)
         Ms.append((d, M))
     Mser = pd.Series(dict(Ms))
