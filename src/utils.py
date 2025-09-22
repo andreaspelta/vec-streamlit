@@ -17,17 +17,21 @@ def make_demo_loads():
     t = pd.date_range("2024-01-01 00:00", periods=8, freq="15min", tz=TZ)
     hh = pd.DataFrame({
         "timestamp (Europe/Rome, ISO8601)": t.strftime("%Y-%m-%d %H:%M:%S%z"),
-        "power_kW (15min average)": [0.8,0.7,0.6,0.5,0.4,0.6,0.9,1.2]
+        "power_kW (15min average)": [0.8,0.7,0.6,0.5,0.4,0.6,0.9,1.2],
+        "meter": "METER_001"
     })
     t2 = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz=TZ)
     shop = pd.DataFrame({
         "timestamp (Europe/Rome, ISO8601)": t2.strftime("%Y-%m-%d %H:%M:%S%z"),
-        "ActiveEnergy_Generale (kWh per 15min)": [0.0,0.0,0.5,0.7,0.8,0.9,0.6,0.4]
+        "ActiveEnergy_Generale (kWh per 15min)": [0.0,0.0,0.5,0.7,0.8,0.9,0.6,0.4],
+        "meter": "SHOP_001"
     })
     return hh, shop
 
+
 def make_demo_pv_json():
-    t = pd.date_range("2024-06-21 05:00", periods=6, freq="h", tz=TZ)  # 'h' instead of 'H'
+    t = pd.date_range("2024-06-21 05:00", periods=6, freq="h", tz=TZ)  # 'h' not 'H'
+
     recs = []
     vals = [0.0, 0.12, 0.35, 0.48, 0.42, 0.20]
     for ts, v in zip(t, vals):
