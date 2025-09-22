@@ -76,28 +76,28 @@ def calibrate_households(raw: pd.DataFrame) -> Dict[str,Any]:
     assert raw is not None and len(raw)>0, "No HH data"
     df = raw.copy()
 
-    # --- NEW: tolerate user/demo headers and normalize ---
-    # timestamp
+    # --- Normalization & defaults (robust to demo headers) ---
     if "timestamp" not in df.columns:
         tcols = [c for c in df.columns if "timestamp" in c.lower()]
         if not tcols:
             raise ValueError("Household data has no timestamp column.")
         df = df.rename(columns={tcols[0]: "timestamp"})
-    # power_kW
     if "power_kW" not in df.columns:
         pcols = [c for c in df.columns if ("power" in c.lower()) and ("kw" in c.lower())]
         if not pcols:
             raise ValueError("Household data has no power_kW column (kW).")
         df = df.rename(columns={pcols[0]: "power_kW"})
+    if "meter" not in df.columns:
+        df["meter"] = "METER_001"
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     # 15-min kW -> hourly kWh
     df["kWh_15"] = df["power_kW"] * 0.25
     df["date"] = df["timestamp"].dt.date
     df["hour"] = df["timestamp"].dt.hour
     df["cluster"] = pd.to_datetime(df["timestamp"]).apply(cluster_label)
-
+    
     agg = df.groupby(["meter","date","hour","cluster"], as_index=False)["kWh_15"].sum()
     day = agg.groupby(["meter","date","cluster"], as_index=False)["kWh_15"].sum().rename(columns={"kWh_15":"E_day"})
     merged = agg.merge(day, on=["meter","date","cluster"], how="left")
@@ -155,14 +155,13 @@ def calibrate_shops(raw: pd.DataFrame) -> Dict[str,Any]:
     assert raw is not None and len(raw)>0, "No SHOP data"
     df = raw.copy()
 
-    # --- NEW: tolerate user/demo headers and normalize ---
+    # --- Normalization & defaults (robust to demo headers) ---
     if "timestamp" not in df.columns:
         tcols = [c for c in df.columns if "timestamp" in c.lower()]
         if not tcols:
             raise ValueError("Shop data has no timestamp column.")
         df = df.rename(columns={tcols[0]: "timestamp"})
     if "energy_kWh" not in df.columns:
-        # accept ActiveEnergy_Generale or any *kWh* column
         if any("activeenergy_generale" in c.lower() for c in df.columns):
             ecol = [c for c in df.columns if "activeenergy_generale" in c.lower()][0]
         else:
@@ -171,13 +170,15 @@ def calibrate_shops(raw: pd.DataFrame) -> Dict[str,Any]:
                 raise ValueError("Shop data has no kWh energy column.")
             ecol = kwh_cols[0]
         df = df.rename(columns={ecol: "energy_kWh"})
+    if "meter" not in df.columns:
+        df["meter"] = "SHOP_001"
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    # -----------------------------------------------------
+    # ---------------------------------------------------------
 
     df["date"] = df["timestamp"].dt.date
     df["hour"] = df["timestamp"].dt.hour
     df["cluster"] = pd.to_datetime(df["timestamp"]).apply(cluster_label)
-
+    
     agg = df.groupby(["meter","date","hour","cluster"], as_index=False)["energy_kWh"].sum()
     day = agg.groupby(["meter","date","cluster"], as_index=False)["energy_kWh"].sum().rename(columns={"energy_kWh":"E_day"})
     merged = agg.merge(day, on=["meter","date","cluster"], how="left")
