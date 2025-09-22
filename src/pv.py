@@ -8,6 +8,17 @@ from scipy import stats
 TZ = "Europe/Rome"
 SEASONS = ["Winter", "Spring", "Summer", "Autumn"]
 
+def make_demo_pv_json() -> Dict[str, Any]:
+    """
+    Tiny per-kWp hourly PV sequence (Summer solstice morning → noon),
+    timezone-aware, suitable for the 'Use sample data (demo)' button.
+    """
+    t = pd.date_range("2024-06-21 05:00", periods=6, freq="h", tz=TZ)
+    vals = [0.0, 0.12, 0.35, 0.48, 0.42, 0.20]
+    recs = [{"timestamp": ts.strftime("%Y-%m-%d %H:%M:%S%z"),
+             "energy_kWh_per_kWp": v} for ts, v in zip(t, vals)]
+    return {"timezone": TZ, "unit": "kWh per kWp per hour", "records": recs}
+
 def load_pv_json(pv_json: Dict[str,Any]) -> pd.DataFrame:
     """Load per-kWp hourly PV JSON -> DataFrame with tz-aware timestamps."""
     recs = pv_json.get("records", [])
@@ -29,7 +40,6 @@ def season_of(dt):
 def _default_envelope() -> pd.Series:
     """Return a simple bell-shaped daylight envelope over 24h normalized to sum=1."""
     h = np.arange(24)
-    # Midday-centered smooth bump; clip nights to 0, normalize to sum=1
     bump = np.exp(-0.5*((h-13)/3.5)**2)
     bump[h < 6] = 0.0
     bump[h > 20] = 0.0
@@ -43,7 +53,6 @@ def _fit_loglogistic_to_unit_median(x: np.ndarray) -> Dict[str,float]:
     if v.size < 6:
         return {"c": 2.0, "scale": 1.0}
     c, loc, scale = stats.fisk.fit(v, floc=0)  # loc=0
-    # median(Fisk) = scale, so normalize to 1
     med = np.median(v)
     scale_adj = scale / max(med, 1e-12)
     return {"c": float(c), "scale": float(scale_adj)}
@@ -63,7 +72,6 @@ def _markov_from_daily(daily_vals: np.ndarray) -> np.ndarray:
         [n00/(n00+n01+1e-9), n01/(n00+n01+1e-9)],
         [n10/(n10+n11+1e-9), n11/(n10+n11+1e-9)]
     ])
-    # Ensure entries are finite and rows sum to ~1
     if not np.all(np.isfinite(P)) or np.any(P<0):
         P = np.array([[0.7, 0.3],[0.3, 0.7]])
     return P
@@ -74,7 +82,6 @@ def _beta_from_ratios(ratios: np.ndarray) -> Dict[str,float]:
     x = x[np.isfinite(x)]
     if x.size < 8:
         return {"alpha": 5.0, "beta": 5.0}
-    # Rescale to (0,1): heuristic y = x/(1+m)
     m = x.mean()
     y = (x / (1.0 + max(m, 1e-9))).clip(1e-3, 1-1e-3)
     my = y.mean()
@@ -105,7 +112,6 @@ def calibrate_pv(pv_json: Dict[str,Any]) -> Dict[str,Any]:
     for s in SEASONS:
         if s in df["season"].unique():
             prof = df[df["season"]==s].groupby("hour")["kWh_per_kWp"].mean().reindex(range(24), fill_value=0.0)
-            # Zero-out nights (heuristic) and normalize
             daylight = prof.copy()
             daylight[daylight < daylight.max()*0.1] = 0.0
             total = daylight.sum()
@@ -124,11 +130,8 @@ def calibrate_pv(pv_json: Dict[str,Any]) -> Dict[str,Any]:
     for s in SEASONS:
         if s in df["season"].unique():
             day = df[df["season"]==s].groupby("date")["kWh_per_kWp"].sum().sort_index()
-            # Log-logistic
             ll_params[s] = _fit_loglogistic_to_unit_median(day.values)
-            # Markov P
             P = _markov_from_daily(day.values)
-            # Beta from (hour / envelope share) ratios
             part = df[df["season"]==s].copy()
             env = pd.Series(S.loc[s].values, index=range(24)).replace(0, np.nan)
             part["ratio"] = part.apply(lambda r: r["kWh_per_kWp"] / env.get(r["hour"], np.nan), axis=1)
